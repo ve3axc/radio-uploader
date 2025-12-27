@@ -20,6 +20,7 @@ import json
 import logging
 import termios
 import threading
+import ssl
 from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 
@@ -350,7 +351,16 @@ class FrequencyPublisher:
             on_error=self._on_error,
             on_message=self._on_message
         )
-        self.ws.run_forever(ping_interval=30, ping_timeout=10)
+        # SSL options - use default CA certs, or skip verification if needed
+        sslopt = {"cert_reqs": ssl.CERT_REQUIRED}
+        try:
+            import certifi
+            sslopt["ca_certs"] = certifi.where()
+        except ImportError:
+            # Fallback: skip verification if certifi not available
+            sslopt = {"cert_reqs": ssl.CERT_NONE}
+
+        self.ws.run_forever(ping_interval=30, ping_timeout=10, sslopt=sslopt)
 
     def _on_open(self, ws):
         """Handle connection opened."""
