@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Ham Radio Cloud Frequency Uploader
+Ham Radio Cloud Frequency Uploader v3 (WebSocket)
 
-Reads frequency from IC-7300 and uploads to Firebase in real-time.
-Designed for one-command setup and reliable 24/7 operation.
+Reads frequency from IC-7300 and publishes to WebSocket server in real-time.
+No Firebase dependency - direct WebSocket for <100ms latency.
 
 Usage:
     python3 freq_uploader.py --station-id YOUR_STATION_ID
@@ -19,13 +19,19 @@ import os
 import json
 import logging
 import termios
+import threading
 from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 
-import requests
 import serial
 from serial.serialutil import SerialException
 from serial.tools import list_ports
+
+try:
+    import websocket
+except ImportError:
+    print("[ERROR] websocket-client not installed. Run: pip3 install websocket-client")
+    sys.exit(1)
 
 # ============================================================================
 # Logging Setup
@@ -45,8 +51,8 @@ logger.addHandler(log_handler)
 # Configuration
 # ============================================================================
 
-# Firebase Realtime Database (Europe West region)
-FIREBASE_URL = "https://ve3axc-online-logger-default-rtdb.europe-west1.firebasedatabase.app"
+# WebSocket Server
+WEBSOCKET_URL = "wss://ws.ve3axc.com"
 
 # IC-7300 CP2102 USB identifiers
 VID = 0x10C4  # Silicon Labs
@@ -90,18 +96,13 @@ def on_signal(signum, frame):
 # ============================================================================
 
 def find_ic7300_port():
-    """
-    Auto-detect IC-7300 serial port by USB VID/PID.
-    Returns /dev/cu.* path (preferred on macOS).
-    """
-    # First pass: look for IC-7300 specifically
+    """Auto-detect IC-7300 serial port by USB VID/PID."""
     for p in list_ports.comports():
         if p.vid == VID and p.pid == PID:
             if p.serial_number and p.serial_number.startswith("IC-7300"):
                 dev = p.device.replace("/dev/tty.", "/dev/cu.")
                 return dev
 
-    # Fallback: any CP210x device
     for p in list_ports.comports():
         if p.vid == VID and p.pid == PID:
             dev = p.device.replace("/dev/tty.", "/dev/cu.")
@@ -171,15 +172,12 @@ def safe_close(ser):
 
 
 def safe_reset_input_buffer(ser):
-    """
-    Best-effort buffer reset. Returns False if device dropped.
-    Uses this instead of raw reset_input_buffer() to avoid crashes.
-    """
+    """Best-effort buffer reset. Returns False if device dropped."""
     try:
         ser.reset_input_buffer()
         return True
     except (termios.error, OSError):
-        return False  # Caller should trigger reconnect
+        return False
 
 
 def snapshot_ports():
@@ -192,15 +190,12 @@ def snapshot_ports():
                 "vid": hex(p.vid) if p.vid else None,
                 "pid": hex(p.pid) if p.pid else None,
                 "serial_number": p.serial_number,
-                "manufacturer": p.manufacturer,
-                "product": p.product,
-                "location": getattr(p, "location", None),
             })
     return out
 
 
 def port_still_listed(port_path: str):
-    """Check if port is still visible in system (vs re-enumerated/dropped)."""
+    """Check if port is still visible in system."""
     if not port_path:
         return False
     for p in list_ports.comports():
@@ -214,10 +209,7 @@ def port_still_listed(port_path: str):
 # ============================================================================
 
 def read_until_fd(ser, deadline_s=0.2, max_bytes=256):
-    """
-    Read from serial until FD terminator or timeout.
-    More reliable than fixed sleep + read.
-    """
+    """Read from serial until FD terminator or timeout."""
     end = time.monotonic() + deadline_s
     buf = bytearray()
     while time.monotonic() < end and len(buf) < max_bytes:
@@ -230,22 +222,12 @@ def read_until_fd(ser, deadline_s=0.2, max_bytes=256):
 
 
 def find_civ_frame(buf: bytes, expect_cmd: int = None):
-    """
-    Find and parse a CI-V frame in the buffer.
-    CI-V frames are not guaranteed to start at byte 0 - there can be
-    partial frames, multiple frames, echo of command, or wrong response.
-
-    If expect_cmd is specified, scans through buffer until finding a frame
-    with that command byte (skips echoes and other frames).
-
-    Returns (to, frm, cmd, payload_bytes) or None if no valid frame found.
-    """
+    """Find and parse a CI-V frame in the buffer."""
     i = 0
     while True:
         i = buf.find(b"\xFE\xFE", i)
         if i < 0:
             return None
-        # Find terminator
         j = buf.find(b"\xFD", i + 2)
         if j < 0:
             return None
@@ -253,11 +235,10 @@ def find_civ_frame(buf: bytes, expect_cmd: int = None):
         if len(frame) >= 6:
             to_, frm, cmd = frame[2], frame[3], frame[4]
             payload = frame[5:-1]
-            # If we're looking for a specific command, check it
             if expect_cmd is None or cmd == expect_cmd:
                 return to_, frm, cmd, payload
-        # Not the frame we want, keep scanning
         i = j + 1
+
 
 def decode_freq(bcd_bytes):
     """Decode BCD frequency bytes to Hz."""
@@ -270,11 +251,8 @@ def decode_freq(bcd_bytes):
 
 def read_frequency(ser):
     """Read frequency from radio via CI-V."""
-    # CI-V: FE FE [to] [from] [cmd] FD
-    # 0x94 = IC-7300, 0xE0 = controller, 0x03 = read freq
     ser.write(bytes([0xFE, 0xFE, CIV_ADDR_RADIO, CIV_ADDR_CONTROLLER, 0x03, 0xFD]))
     resp = read_until_fd(ser, deadline_s=0.2)
-
     parsed = find_civ_frame(resp, expect_cmd=0x03)
     if not parsed:
         return None
@@ -286,10 +264,8 @@ def read_frequency(ser):
 
 def read_mode(ser):
     """Read mode from radio via CI-V."""
-    # 0x04 = read mode
     ser.write(bytes([0xFE, 0xFE, CIV_ADDR_RADIO, CIV_ADDR_CONTROLLER, 0x04, 0xFD]))
     resp = read_until_fd(ser, deadline_s=0.2)
-
     parsed = find_civ_frame(resp, expect_cmd=0x04)
     if not parsed:
         return None
@@ -300,31 +276,117 @@ def read_mode(ser):
 
 
 # ============================================================================
-# Firebase Functions
+# WebSocket Publisher
 # ============================================================================
 
-def upload_to_firebase(station_id, data):
-    """
-    Upload station data to Firebase Realtime Database.
-    Uses REST API with PUT to update the station's data.
-    """
-    url = f"{FIREBASE_URL}/stations/{station_id}.json"
-    try:
-        response = requests.put(url, json=data, timeout=5)
-        response.raise_for_status()
-        return True
-    except requests.exceptions.RequestException as e:
-        print(f"[UPLOAD] Error: {e}")
-        return False
+class FrequencyPublisher:
+    """WebSocket client for publishing frequency updates."""
 
+    def __init__(self, station_id):
+        self.station_id = station_id
+        self.ws = None
+        self.connected = False
+        self.reconnect_delay = 1.0
+        self.max_reconnect_delay = 30.0
+        self.lock = threading.Lock()
+        self.should_run = True
+        self.ws_thread = None
 
-def set_offline(station_id):
-    """Mark station as offline in Firebase."""
-    url = f"{FIREBASE_URL}/stations/{station_id}/online.json"
-    try:
-        requests.put(url, json=False, timeout=5)
-    except Exception:
-        pass  # Best effort
+    def start(self):
+        """Start the WebSocket connection in a background thread."""
+        self.should_run = True
+        self.ws_thread = threading.Thread(target=self._run_forever, daemon=True)
+        self.ws_thread.start()
+
+    def stop(self):
+        """Stop the WebSocket connection."""
+        self.should_run = False
+        if self.ws:
+            try:
+                self.ws.close()
+            except Exception:
+                pass
+
+    def _run_forever(self):
+        """Run WebSocket with auto-reconnection."""
+        while self.should_run:
+            try:
+                self._connect()
+            except Exception as e:
+                logger.error("WebSocket error: %s", e)
+
+            if self.should_run:
+                print(f"[WS] Reconnecting in {self.reconnect_delay:.1f}s...")
+                time.sleep(self.reconnect_delay)
+                self.reconnect_delay = min(self.reconnect_delay * 2, self.max_reconnect_delay)
+
+    def _connect(self):
+        """Establish WebSocket connection."""
+        self.ws = websocket.WebSocketApp(
+            WEBSOCKET_URL,
+            on_open=self._on_open,
+            on_close=self._on_close,
+            on_error=self._on_error,
+            on_message=self._on_message
+        )
+        self.ws.run_forever(ping_interval=30, ping_timeout=10)
+
+    def _on_open(self, ws):
+        """Handle connection opened."""
+        with self.lock:
+            self.connected = True
+            self.reconnect_delay = 1.0
+        print("[WS] Connected to server")
+        logger.info("WebSocket connected")
+
+    def _on_close(self, ws, close_status_code, close_msg):
+        """Handle connection closed."""
+        with self.lock:
+            self.connected = False
+        print(f"[WS] Disconnected (code={close_status_code})")
+        logger.info("WebSocket disconnected: %s", close_msg)
+
+    def _on_error(self, ws, error):
+        """Handle connection error."""
+        with self.lock:
+            self.connected = False
+        print(f"[WS] Error: {error}")
+        logger.error("WebSocket error: %s", error)
+
+    def _on_message(self, ws, message):
+        """Handle incoming messages (not expected, but log them)."""
+        try:
+            data = json.loads(message)
+            if data.get("type") == "error":
+                print(f"[WS] Server error: {data.get('message')}")
+        except Exception:
+            pass
+
+    def publish(self, freq_hz, mode):
+        """Publish frequency update to server."""
+        with self.lock:
+            if not self.connected or not self.ws:
+                return False
+
+        try:
+            message = json.dumps({
+                "type": "publish",
+                "station_id": self.station_id,
+                "data": {
+                    "frequency_hz": freq_hz,
+                    "mode": mode or "UNKNOWN"
+                }
+            })
+            self.ws.send(message)
+            return True
+        except Exception as e:
+            logger.error("Publish error: %s", e)
+            return False
+
+    def is_connected(self):
+        """Check if currently connected."""
+        with self.lock:
+            return self.connected
 
 
 # ============================================================================
@@ -347,7 +409,7 @@ Examples:
     parser.add_argument("--station-id", required=True,
                         help="Your unique station ID from the web app")
     parser.add_argument("--callsign", default=None,
-                        help="Your callsign (optional, shown in data)")
+                        help="Your callsign (optional)")
     parser.add_argument("--port", default=None,
                         help="Serial port (default: auto-detect)")
     parser.add_argument("--interval", type=float, default=1.0,
@@ -356,16 +418,14 @@ Examples:
                         help="Min seconds between uploads if no change (default: 5.0)")
     args = parser.parse_args()
 
-    # Validate station ID
     if not args.station_id or len(args.station_id) < 4:
         print("[ERROR] Invalid station ID. Get yours from the web app.")
         sys.exit(1)
 
-    # Set up signal handlers
     signal.signal(signal.SIGINT, on_signal)
     signal.signal(signal.SIGTERM, on_signal)
 
-    # Start caffeinate to prevent system sleep (macOS)
+    # Start caffeinate (macOS)
     caffeinate_proc = None
     if sys.platform == "darwin":
         try:
@@ -376,24 +436,33 @@ Examples:
             )
             print("[INIT] Sleep prevention: ACTIVE")
         except Exception:
-            print("[INIT] Sleep prevention: FAILED (caffeinate not found)")
+            print("[INIT] Sleep prevention: FAILED")
 
     print(f"[INIT] Station ID: {args.station_id}")
+    print(f"[INIT] WebSocket: {WEBSOCKET_URL}")
     print(f"[INIT] Logging to: {LOG_PATH}")
     if args.callsign:
         print(f"[INIT] Callsign: {args.callsign}")
-    logger.info("START pid=%s station_id=%s callsign=%s argv=%s",
-                os.getpid(), args.station_id, args.callsign, sys.argv)
+    logger.info("START pid=%s station_id=%s callsign=%s",
+                os.getpid(), args.station_id, args.callsign)
     print("-" * 60)
+
+    # Start WebSocket publisher
+    publisher = FrequencyPublisher(args.station_id)
+    publisher.start()
+    print("[INIT] WebSocket publisher started")
+
+    # Wait briefly for initial connection
+    time.sleep(1.0)
 
     ser = None
     backoff = 1.0
     last_freq = 0
     last_mode = ""
-    last_upload_time = 0
-    upload_count = 0
+    last_publish_time = 0
+    publish_count = 0
     reconnect_count = 0
-    last_good_time = time.monotonic()  # Track time since last valid response
+    last_good_time = time.monotonic()
 
     while not stop_requested:
         try:
@@ -406,76 +475,55 @@ Examples:
 
                 ser = open_serial(args.port)
 
-                # Safe buffer flush on connect (may fail if device drops immediately)
                 if not safe_reset_input_buffer(ser):
                     raise OSError("Device dropped immediately after connect")
 
-                backoff = 1.0  # Reset backoff on success
-                last_good_time = time.monotonic()  # Reset timeout on new connection
+                backoff = 1.0
+                last_good_time = time.monotonic()
                 reconnect_count += 1
                 conn_msg = f"[CONN] Connected to {ser.port}"
                 if reconnect_count > 1:
                     conn_msg += f" (reconnect #{reconnect_count})"
                 print(conn_msg)
-                logger.info("CONNECTED port=%s snapshot=%s", ser.port,
-                            json.dumps(snapshot_ports(), ensure_ascii=False))
+                logger.info("CONNECTED port=%s", ser.port)
                 print("-" * 60)
 
-            # Poll frequency and mode (with small gap to avoid response overlap)
+            # Poll frequency and mode
             freq = read_frequency(ser)
-            time.sleep(0.01)  # Small gap between commands
+            time.sleep(0.01)
             mode = read_mode(ser)
 
-            # Count as success if we got EITHER freq or mode
             got_any = freq is not None or mode is not None
 
             if got_any:
-                last_good_time = time.monotonic()  # Reset timeout on valid response
+                last_good_time = time.monotonic()
 
             if freq is not None:
                 freq_mhz = freq / 1e6
                 timestamp = datetime.now().strftime("%H:%M:%S")
                 now = time.time()
 
-                # Decide if we should upload
                 freq_changed = (freq != last_freq or mode != last_mode)
-                time_to_heartbeat = (now - last_upload_time) >= args.upload_interval
+                # Publish on change, or every 5 seconds as heartbeat
+                time_to_heartbeat = (now - last_publish_time) >= 5.0
 
                 if freq_changed or time_to_heartbeat:
-                    # Build data payload
-                    data = {
-                        "frequency_hz": freq,
-                        "frequency_mhz": round(freq_mhz, 6),
-                        "mode": mode or "UNKNOWN",
-                        "radio_model": "IC-7300",
-                        "last_updated": datetime.now(timezone.utc).isoformat(),
-                        "online": True
-                    }
-                    if args.callsign:
-                        data["callsign"] = args.callsign.upper()
-
-                    # Upload to Firebase
-                    if upload_to_firebase(args.station_id, data):
-                        upload_count += 1
-                        status = "-> uploaded" if freq_changed else "[heartbeat]"
-                        print(f"[{timestamp}] {freq_mhz:12.6f} MHz  {mode or '':5} {status}")
-                        last_upload_time = now
+                    if publisher.publish(freq, mode):
+                        publish_count += 1
+                        ws_status = "WS" if publisher.is_connected() else "queued"
+                        change_indicator = "->" if freq_changed else "  "
+                        print(f"[{timestamp}] {freq_mhz:12.6f} MHz  {mode or '':5} {change_indicator} [{ws_status}]")
+                        last_publish_time = now
                     else:
-                        print(f"[{timestamp}] {freq_mhz:12.6f} MHz  {mode or '':5} [upload failed]")
+                        print(f"[{timestamp}] {freq_mhz:12.6f} MHz  {mode or '':5}    [offline]")
 
                     last_freq = freq
                     last_mode = mode
 
             elif not got_any:
-                # No response from radio
                 no_resp_seconds = time.monotonic() - last_good_time
-
-                # If port is open but radio not responding for too long, force reconnect
                 if no_resp_seconds >= NO_RESPONSE_TIMEOUT:
-                    logger.warning("NO_RESPONSE timeout=%.1fs port=%s is_open=%s snapshot=%s",
-                                   no_resp_seconds, getattr(ser, "port", None),
-                                   getattr(ser, "is_open", None),
-                                   json.dumps(snapshot_ports(), ensure_ascii=False))
+                    logger.warning("NO_RESPONSE timeout=%.1fs", no_resp_seconds)
                     raise PlannedReconnect(f"No CI-V response for {no_resp_seconds:.1f}s")
 
             if stop_requested:
@@ -484,7 +532,6 @@ Examples:
             time.sleep(args.interval)
 
         except PlannedReconnect as e:
-            # Expected reconnect (no response timeout) - log as WARNING, not ERROR
             error_time = datetime.now().strftime("%H:%M:%S")
             print(f"[{error_time}] RECONNECT: {e}")
 
@@ -503,18 +550,9 @@ Examples:
                 backoff = min(backoff * 2, 10.0)
 
         except (OSError, SerialException, FileNotFoundError, termios.error) as e:
-            # USB disconnect, port gone, device not found, or termios failure
             error_time = datetime.now().strftime("%H:%M:%S")
             print(f"[{error_time}] ERROR: {type(e).__name__}: {e}")
-
-            # Log detailed exception info
-            errno = getattr(e, "errno", None)
-            port_path = getattr(ser, "port", None)
-            logger.error("EXCEPTION type=%s errno=%s msg=%r port=%s is_open=%s port_still_listed=%s snapshot=%s",
-                         type(e).__name__, errno, str(e),
-                         port_path, getattr(ser, "is_open", None),
-                         port_still_listed(port_path),
-                         json.dumps(snapshot_ports(), ensure_ascii=False))
+            logger.error("EXCEPTION type=%s msg=%r", type(e).__name__, str(e))
 
             if ser:
                 safe_close(ser)
@@ -522,33 +560,28 @@ Examples:
 
             if not stop_requested:
                 print(f"[WAIT] Reconnecting in {backoff:.1f}s...")
-                logger.info("RECONNECT backoff=%.1fs", backoff)
-
-                # Sleep in small chunks so we can respond to Ctrl+C
                 wait_end = time.time() + backoff
                 while time.time() < wait_end and not stop_requested:
                     time.sleep(0.1)
-
-                backoff = min(backoff * 2, 10.0)  # Exponential backoff, max 10s
+                backoff = min(backoff * 2, 10.0)
 
     # Clean shutdown
     print("-" * 60)
-    print("[EXIT] Setting station offline...")
-    set_offline(args.station_id)
+    print("[EXIT] Stopping WebSocket publisher...")
+    publisher.stop()
 
     if ser:
         print("[EXIT] Closing serial port...")
         safe_close(ser)
 
-    # Terminate caffeinate (will auto-exit via -w, but explicit is cleaner)
     if caffeinate_proc:
         try:
             caffeinate_proc.terminate()
         except Exception:
             pass
 
-    print(f"[EXIT] Done. Uploads: {upload_count}, Reconnects: {reconnect_count}")
-    logger.info("EXIT uploads=%s reconnects=%s", upload_count, reconnect_count)
+    print(f"[EXIT] Done. Published: {publish_count}, Reconnects: {reconnect_count}")
+    logger.info("EXIT publishes=%s reconnects=%s", publish_count, reconnect_count)
 
 
 if __name__ == "__main__":
