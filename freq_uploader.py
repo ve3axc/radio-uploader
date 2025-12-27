@@ -23,15 +23,36 @@ import threading
 from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 
-import serial
-from serial.serialutil import SerialException
-from serial.tools import list_ports
+def install_package(package_name):
+    """Auto-install missing package."""
+    print(f"[INIT] Installing {package_name}...")
+    try:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", package_name, "--quiet"])
+        print(f"[INIT] {package_name} installed successfully")
+        return True
+    except subprocess.CalledProcessError:
+        print(f"[ERROR] Failed to install {package_name}. Try: pip3 install {package_name}")
+        return False
+
+try:
+    import serial
+    from serial.serialutil import SerialException
+    from serial.tools import list_ports
+except ImportError:
+    if install_package("pyserial"):
+        import serial
+        from serial.serialutil import SerialException
+        from serial.tools import list_ports
+    else:
+        sys.exit(1)
 
 try:
     import websocket
 except ImportError:
-    print("[ERROR] websocket-client not installed. Run: pip3 install websocket-client")
-    sys.exit(1)
+    if install_package("websocket-client"):
+        import websocket
+    else:
+        sys.exit(1)
 
 # ============================================================================
 # Logging Setup
