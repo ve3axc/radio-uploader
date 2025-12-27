@@ -443,8 +443,8 @@ Examples:
                         help="Your callsign (optional)")
     parser.add_argument("--port", default=None,
                         help="Serial port (default: auto-detect)")
-    parser.add_argument("--interval", type=float, default=1.0,
-                        help="Poll interval in seconds (default: 1.0)")
+    parser.add_argument("--interval", type=float, default=0.3,
+                        help="Poll interval in seconds (default: 0.3)")
     parser.add_argument("--upload-interval", type=float, default=5.0,
                         help="Min seconds between uploads if no change (default: 5.0)")
     args = parser.parse_args()
