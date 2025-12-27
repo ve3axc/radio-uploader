@@ -535,8 +535,8 @@ Examples:
                 now = time.time()
 
                 freq_changed = (freq != last_freq or mode != last_mode)
-                # Publish on change, or every 5 seconds as heartbeat
-                time_to_heartbeat = (now - last_publish_time) >= 5.0
+                # Publish on change, or every 1 second as heartbeat
+                time_to_heartbeat = (now - last_publish_time) >= 1.0
 
                 if freq_changed or time_to_heartbeat:
                     if publisher.publish(freq, mode):
