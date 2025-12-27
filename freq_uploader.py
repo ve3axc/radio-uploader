@@ -65,9 +65,6 @@ MODE_MAP = {
 # No-response timeout (force reconnect after this many seconds)
 NO_RESPONSE_TIMEOUT = 10.0
 
-# Pause check interval (how often to poll Firebase for pause flag)
-PAUSE_CHECK_INTERVAL = 2.0
-
 # Global stop flag
 stop_requested = False
 
@@ -330,31 +327,6 @@ def set_offline(station_id):
         pass  # Best effort
 
 
-def check_paused(station_id):
-    """
-    Check if station is paused (user clicked Disconnect in web app).
-    Returns True if paused, False otherwise.
-    """
-    url = f"{FIREBASE_URL}/stations/{station_id}/paused.json"
-    try:
-        response = requests.get(url, timeout=3)
-        if response.status_code == 200:
-            result = response.json()
-            return result is True
-    except Exception:
-        pass  # Network error - assume not paused
-    return False
-
-
-def set_paused_status(station_id, paused):
-    """Set the paused status in Firebase (used on startup to clear any stale pause)."""
-    url = f"{FIREBASE_URL}/stations/{station_id}/paused.json"
-    try:
-        requests.put(url, json=paused, timeout=3)
-    except Exception:
-        pass  # Best effort
-
-
 # ============================================================================
 # Main
 # ============================================================================
@@ -423,36 +395,8 @@ Examples:
     reconnect_count = 0
     last_good_time = time.monotonic()  # Track time since last valid response
 
-    # Pause/resume state (controlled by web app)
-    is_paused = False
-    last_pause_check = 0
-
-    # Clear any stale pause flag on startup
-    set_paused_status(args.station_id, False)
-
     while not stop_requested:
         try:
-            # Check if paused by web app (every PAUSE_CHECK_INTERVAL seconds)
-            now = time.time()
-            if now - last_pause_check >= PAUSE_CHECK_INTERVAL:
-                last_pause_check = now
-                was_paused = is_paused
-                is_paused = check_paused(args.station_id)
-
-                if is_paused and not was_paused:
-                    print("[PAUSE] Paused by web app. Waiting for resume...")
-                    set_offline(args.station_id)
-                    if ser:
-                        safe_close(ser)
-                        ser = None
-                elif not is_paused and was_paused:
-                    print("[RESUME] Resumed by web app. Reconnecting...")
-
-            # If paused, just sleep and continue
-            if is_paused:
-                time.sleep(1.0)
-                continue
-
             # Connect/reconnect if needed
             if ser is None or not ser.is_open:
                 if args.port:
