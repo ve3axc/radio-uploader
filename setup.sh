@@ -11,7 +11,7 @@
 #   1. Checks/installs Python 3
 #   2. Creates ~/.radio-uploader/ directory
 #   3. Downloads freq_uploader.py
-#   4. Installs dependencies (pyserial, requests)
+#   4. Installs dependencies (pyserial, websocket-client, certifi)
 #   5. Starts uploading your frequency to the cloud
 #
 # ============================================================================
@@ -157,7 +157,7 @@ print_success "Downloaded freq_uploader.py"
 print_step "Installing dependencies..."
 
 pip install --quiet --upgrade pip
-pip install --quiet pyserial requests
+pip install --quiet pyserial websocket-client certifi
 
 print_success "Dependencies installed"
 
