@@ -297,6 +297,29 @@ def read_mode(ser):
     return None
 
 
+def read_tx_status(ser):
+    """Read TX/RX status by checking Power Output meter via CI-V.
+
+    Uses command 0x15 0x11 to read the PO (Power Output) meter.
+    If the meter shows any power output, we're transmitting.
+    This is more reliable than querying PTT status directly.
+    """
+    # Command 0x15, sub-command 0x11 = Read PO (Power Output) meter
+    # Returns 0000-0255 (0000=0%, 0143=50%, 0213=100%)
+    ser.write(bytes([0xFE, 0xFE, CIV_ADDR_RADIO, CIV_ADDR_CONTROLLER, 0x15, 0x11, 0xFD]))
+    resp = read_until_fd(ser, deadline_s=0.2)
+    parsed = find_civ_frame(resp, expect_cmd=0x15)
+    if not parsed:
+        return False  # Default to RX if no response
+    to_, frm, cmd, payload = parsed
+    # Payload format: [0x11, low_byte, high_byte] for PO meter
+    if len(payload) >= 3 and payload[0] == 0x11:
+        # If either power byte is non-zero, we're transmitting
+        power_level = payload[1] + payload[2]
+        return power_level > 0
+    return False
+
+
 # ============================================================================
 # WebSocket Publisher
 # ============================================================================
@@ -393,7 +416,7 @@ class FrequencyPublisher:
         except Exception:
             pass
 
-    def publish(self, freq_hz, mode):
+    def publish(self, freq_hz, mode, tx_status=False):
         """Publish frequency update to server."""
         with self.lock:
             if not self.connected or not self.ws:
@@ -405,7 +428,8 @@ class FrequencyPublisher:
                 "station_id": self.station_id,
                 "data": {
                     "frequency_hz": freq_hz,
-                    "mode": mode or "UNKNOWN"
+                    "mode": mode or "UNKNOWN",
+                    "tx_status": tx_status
                 }
             })
             self.ws.send(message)
@@ -519,10 +543,12 @@ Examples:
                 logger.info("CONNECTED port=%s", ser.port)
                 print("-" * 60)
 
-            # Poll frequency and mode
+            # Poll frequency, mode, and TX status
             freq = read_frequency(ser)
             time.sleep(0.01)
             mode = read_mode(ser)
+            time.sleep(0.01)
+            tx_status = read_tx_status(ser)
 
             got_any = freq is not None or mode is not None
 
@@ -539,11 +565,12 @@ Examples:
                 time_to_heartbeat = (now - last_publish_time) >= 1.0
 
                 if freq_changed or time_to_heartbeat:
-                    if publisher.publish(freq, mode):
+                    if publisher.publish(freq, mode, tx_status):
                         publish_count += 1
                         ws_status = "WS" if publisher.is_connected() else "queued"
                         change_indicator = "->" if freq_changed else "  "
-                        print(f"[{timestamp}] {freq_mhz:12.6f} MHz  {mode or '':5} {change_indicator} [{ws_status}]")
+                        tx_indicator = "TX" if tx_status else "RX"
+                        print(f"[{timestamp}] {freq_mhz:12.6f} MHz  {mode or '':5} {tx_indicator} {change_indicator} [{ws_status}]")
                         last_publish_time = now
                     else:
                         print(f"[{timestamp}] {freq_mhz:12.6f} MHz  {mode or '':5}    [offline]")
