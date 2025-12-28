@@ -537,12 +537,18 @@ class FirebaseListener:
 
                 if line:
                     line_str = line.decode('utf-8')
-                    # SSE format: "data: <json_value>"
+                    # Firebase SSE format: "data: {"path":"/","data":VALUE}"
                     if line_str.startswith('data:'):
                         data_str = line_str[5:].strip()
                         if data_str and data_str != 'null':
                             try:
-                                freq_hz = json.loads(data_str)
+                                parsed = json.loads(data_str)
+                                # Extract frequency from Firebase wrapper
+                                if isinstance(parsed, dict) and 'data' in parsed:
+                                    freq_hz = parsed['data']
+                                else:
+                                    freq_hz = parsed
+
                                 if isinstance(freq_hz, (int, float)) and freq_hz > 0:
                                     # Only queue if different from last known
                                     if freq_hz != self.last_freq:
