@@ -298,25 +298,20 @@ def read_mode(ser):
 
 
 def read_tx_status(ser):
-    """Read TX/RX status by checking Power Output meter via CI-V.
+    """Read TX/RX status via CI-V command 0x1C 0x00.
 
-    Uses command 0x15 0x11 to read the PO (Power Output) meter.
-    If the meter shows any power output, we're transmitting.
-    This is more reliable than querying PTT status directly.
+    Response format: FE FE E0 94 1C 00 XX FD
+    Where XX = 0x00 for RX, 0x01 for TX
     """
-    # Command 0x15, sub-command 0x11 = Read PO (Power Output) meter
-    # Returns 0000-0255 (0000=0%, 0143=50%, 0213=100%)
-    ser.write(bytes([0xFE, 0xFE, CIV_ADDR_RADIO, CIV_ADDR_CONTROLLER, 0x15, 0x11, 0xFD]))
+    ser.write(bytes([0xFE, 0xFE, CIV_ADDR_RADIO, CIV_ADDR_CONTROLLER, 0x1C, 0x00, 0xFD]))
     resp = read_until_fd(ser, deadline_s=0.2)
-    parsed = find_civ_frame(resp, expect_cmd=0x15)
+    parsed = find_civ_frame(resp, expect_cmd=0x1C)
     if not parsed:
         return False  # Default to RX if no response
     to_, frm, cmd, payload = parsed
-    # Payload format: [0x11, low_byte, high_byte] for PO meter
-    if len(payload) >= 3 and payload[0] == 0x11:
-        # If either power byte is non-zero, we're transmitting
-        power_level = payload[1] + payload[2]
-        return power_level > 0
+    # Payload format: [0x00, status] where status = 0x00 (RX) or 0x01 (TX)
+    if len(payload) >= 2 and payload[0] == 0x00:
+        return payload[1] == 0x01
     return False
 
 
