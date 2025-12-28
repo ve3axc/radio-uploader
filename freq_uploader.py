@@ -488,83 +488,51 @@ class FrequencyPublisher:
 # ============================================================================
 
 class FirebaseListener:
-    """Listens to Firebase for frequency change commands via SSE."""
+    """Polls Firebase for frequency change commands."""
 
     def __init__(self, station_id):
         self.station_id = station_id
         self.should_run = True
         self.thread = None
         self.last_freq = None
+        self.poll_interval = 2.0  # Check every 2 seconds
 
     def start(self):
         """Start the Firebase listener in a background thread."""
         self.should_run = True
-        self.thread = threading.Thread(target=self._listen_loop, daemon=True)
+        self.thread = threading.Thread(target=self._poll_loop, daemon=True)
         self.thread.start()
 
     def stop(self):
         """Stop the Firebase listener."""
         self.should_run = False
 
-    def _listen_loop(self):
-        """Main listener loop with reconnection."""
+    def _poll_loop(self):
+        """Poll Firebase for frequency changes."""
+        url = f"{FIREBASE_DB_URL}/stations/{self.station_id}/target_freq.json"
+        print(f"[FB] Polling for frequency commands...")
+        logger.info("Firebase polling started: %s", url)
+
         while self.should_run:
             try:
-                self._connect_and_listen()
+                response = requests.get(url, timeout=5)
+                if response.status_code == 200:
+                    freq_hz = response.json()
+                    if isinstance(freq_hz, (int, float)) and freq_hz > 0:
+                        # Only queue if different from last known
+                        if freq_hz != self.last_freq:
+                            self.last_freq = freq_hz
+                            command_queue.put({
+                                'type': 'set_freq',
+                                'frequency_hz': int(freq_hz)
+                            })
+                            print(f"[FB] Received command: tune to {freq_hz/1e6:.6f} MHz")
+                            logger.info("Firebase command received: %s Hz", freq_hz)
             except Exception as e:
-                logger.error("Firebase listener error: %s", e)
-                if self.should_run:
-                    time.sleep(5)  # Wait before reconnecting
+                logger.error("Firebase poll error: %s", e)
 
-    def _connect_and_listen(self):
-        """Connect to Firebase SSE and listen for changes."""
-        url = f"{FIREBASE_DB_URL}/stations/{self.station_id}/target_freq.json"
-        print(f"[FB] Listening for frequency commands...")
-        logger.info("Firebase listener started: %s", url)
-
-        try:
-            response = requests.get(
-                url,
-                headers={"Accept": "text/event-stream"},
-                stream=True,
-                timeout=None  # SSE is long-lived
-            )
-            response.raise_for_status()
-
-            for line in response.iter_lines():
-                if not self.should_run:
-                    break
-
-                if line:
-                    line_str = line.decode('utf-8')
-                    # Firebase SSE format: "data: {"path":"/","data":VALUE}"
-                    if line_str.startswith('data:'):
-                        data_str = line_str[5:].strip()
-                        if data_str and data_str != 'null':
-                            try:
-                                parsed = json.loads(data_str)
-                                # Extract frequency from Firebase wrapper
-                                if isinstance(parsed, dict) and 'data' in parsed:
-                                    freq_hz = parsed['data']
-                                else:
-                                    freq_hz = parsed
-
-                                if isinstance(freq_hz, (int, float)) and freq_hz > 0:
-                                    # Only queue if different from last known
-                                    if freq_hz != self.last_freq:
-                                        self.last_freq = freq_hz
-                                        command_queue.put({
-                                            'type': 'set_freq',
-                                            'frequency_hz': int(freq_hz)
-                                        })
-                                        print(f"[FB] Received command: tune to {freq_hz/1e6:.6f} MHz")
-                                        logger.info("Firebase command received: %s Hz", freq_hz)
-                            except (json.JSONDecodeError, ValueError):
-                                pass
-
-        except requests.exceptions.RequestException as e:
-            logger.error("Firebase SSE connection error: %s", e)
-            raise
+            # Wait before next poll
+            time.sleep(self.poll_interval)
 
 
 # ============================================================================
