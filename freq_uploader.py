@@ -55,6 +55,16 @@ except ImportError:
     else:
         sys.exit(1)
 
+try:
+    import requests
+except ImportError:
+    if install_package("requests"):
+        import requests
+    else:
+        sys.exit(1)
+
+import queue
+
 # ============================================================================
 # Logging Setup
 # ============================================================================
@@ -75,6 +85,12 @@ logger.addHandler(log_handler)
 
 # WebSocket Server
 WEBSOCKET_URL = "wss://ws.ve3axc.com"
+
+# Firebase Realtime Database (for receiving frequency commands)
+FIREBASE_DB_URL = "https://ve3axc-online-logger-default-rtdb.firebaseio.com"
+
+# Command queue for frequency changes from Firebase
+command_queue = queue.Queue()
 
 # IC-7300 CP2102 USB identifiers
 VID = 0x10C4  # Silicon Labs
@@ -315,6 +331,34 @@ def read_tx_status(ser):
     return False
 
 
+def freq_to_bcd(freq_hz):
+    """Convert frequency in Hz to 5-byte BCD for CI-V command 0x05.
+
+    Example: 14025000 Hz -> [0x00, 0x50, 0x02, 0x14, 0x00]
+    """
+    s = f"{freq_hz:010d}"  # 10 digits, zero-padded
+    bcd = []
+    for i in range(0, 10, 2):
+        # Take pairs from the right, reverse order
+        high = int(s[9 - i - 1])
+        low = int(s[9 - i])
+        bcd.append((high << 4) | low)
+    return bcd
+
+
+def set_frequency(ser, freq_hz):
+    """Set radio frequency via CI-V command 0x05.
+
+    Returns True if successful, False otherwise.
+    """
+    bcd = freq_to_bcd(freq_hz)
+    cmd = [0xFE, 0xFE, CIV_ADDR_RADIO, CIV_ADDR_CONTROLLER, 0x05] + bcd + [0xFD]
+    ser.write(bytes(cmd))
+    resp = read_until_fd(ser, deadline_s=0.3)
+    # FB = OK, FA = NG
+    return b'\xFB' in resp
+
+
 # ============================================================================
 # WebSocket Publisher
 # ============================================================================
@@ -440,6 +484,84 @@ class FrequencyPublisher:
 
 
 # ============================================================================
+# Firebase Listener (for remote frequency control)
+# ============================================================================
+
+class FirebaseListener:
+    """Listens to Firebase for frequency change commands via SSE."""
+
+    def __init__(self, station_id):
+        self.station_id = station_id
+        self.should_run = True
+        self.thread = None
+        self.last_freq = None
+
+    def start(self):
+        """Start the Firebase listener in a background thread."""
+        self.should_run = True
+        self.thread = threading.Thread(target=self._listen_loop, daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        """Stop the Firebase listener."""
+        self.should_run = False
+
+    def _listen_loop(self):
+        """Main listener loop with reconnection."""
+        while self.should_run:
+            try:
+                self._connect_and_listen()
+            except Exception as e:
+                logger.error("Firebase listener error: %s", e)
+                if self.should_run:
+                    time.sleep(5)  # Wait before reconnecting
+
+    def _connect_and_listen(self):
+        """Connect to Firebase SSE and listen for changes."""
+        url = f"{FIREBASE_DB_URL}/stations/{self.station_id}/target_freq.json"
+        print(f"[FB] Listening for frequency commands...")
+        logger.info("Firebase listener started: %s", url)
+
+        try:
+            response = requests.get(
+                url,
+                headers={"Accept": "text/event-stream"},
+                stream=True,
+                timeout=None  # SSE is long-lived
+            )
+            response.raise_for_status()
+
+            for line in response.iter_lines():
+                if not self.should_run:
+                    break
+
+                if line:
+                    line_str = line.decode('utf-8')
+                    # SSE format: "data: <json_value>"
+                    if line_str.startswith('data:'):
+                        data_str = line_str[5:].strip()
+                        if data_str and data_str != 'null':
+                            try:
+                                freq_hz = json.loads(data_str)
+                                if isinstance(freq_hz, (int, float)) and freq_hz > 0:
+                                    # Only queue if different from last known
+                                    if freq_hz != self.last_freq:
+                                        self.last_freq = freq_hz
+                                        command_queue.put({
+                                            'type': 'set_freq',
+                                            'frequency_hz': int(freq_hz)
+                                        })
+                                        print(f"[FB] Received command: tune to {freq_hz/1e6:.6f} MHz")
+                                        logger.info("Firebase command received: %s Hz", freq_hz)
+                            except (json.JSONDecodeError, ValueError):
+                                pass
+
+        except requests.exceptions.RequestException as e:
+            logger.error("Firebase SSE connection error: %s", e)
+            raise
+
+
+# ============================================================================
 # Main
 # ============================================================================
 
@@ -502,7 +624,12 @@ Examples:
     publisher.start()
     print("[INIT] WebSocket publisher started")
 
-    # Wait briefly for initial connection
+    # Start Firebase listener for remote frequency control
+    firebase_listener = FirebaseListener(args.station_id)
+    firebase_listener.start()
+    print("[INIT] Firebase listener started")
+
+    # Wait briefly for initial connections
     time.sleep(1.0)
 
     ser = None
@@ -537,6 +664,23 @@ Examples:
                 print(conn_msg)
                 logger.info("CONNECTED port=%s", ser.port)
                 print("-" * 60)
+
+            # Check for pending frequency commands from Firebase
+            try:
+                cmd = command_queue.get_nowait()
+                if cmd.get('type') == 'set_freq':
+                    target_freq = cmd['frequency_hz']
+                    timestamp = datetime.now().strftime("%H:%M:%S")
+                    print(f"[{timestamp}] TUNING to {target_freq/1e6:.6f} MHz...")
+                    if set_frequency(ser, target_freq):
+                        print(f"[{timestamp}] TUNED to {target_freq/1e6:.6f} MHz")
+                        logger.info("Set frequency: %s Hz", target_freq)
+                    else:
+                        print(f"[{timestamp}] TUNE FAILED for {target_freq/1e6:.6f} MHz")
+                        logger.error("Failed to set frequency: %s Hz", target_freq)
+                    time.sleep(0.1)  # Brief pause for radio to settle
+            except queue.Empty:
+                pass
 
             # Poll frequency, mode, and TX status
             freq = read_frequency(ser)
@@ -620,6 +764,8 @@ Examples:
 
     # Clean shutdown
     print("-" * 60)
+    print("[EXIT] Stopping Firebase listener...")
+    firebase_listener.stop()
     print("[EXIT] Stopping WebSocket publisher...")
     publisher.stop()
 
