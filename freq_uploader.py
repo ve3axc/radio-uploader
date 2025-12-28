@@ -87,7 +87,7 @@ logger.addHandler(log_handler)
 WEBSOCKET_URL = "wss://ws.ve3axc.com"
 
 # Firebase Realtime Database (for receiving frequency commands)
-FIREBASE_DB_URL = "https://ve3axc-online-logger-default-rtdb.firebaseio.com"
+FIREBASE_DB_URL = "https://ve3axc-online-logger-default-rtdb.europe-west1.firebasedatabase.app"
 
 # Command queue for frequency changes from Firebase
 command_queue = queue.Queue()
