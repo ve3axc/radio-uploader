@@ -408,16 +408,23 @@ class FrequencyPublisher:
         self.ws = None
         self.connected = False
         self.reconnect_delay = 1.0
-        self.max_reconnect_delay = 30.0
+        self.max_reconnect_delay = 10.0  # Reduced from 30s for faster recovery
         self.lock = threading.Lock()
         self.should_run = True
         self.ws_thread = None
+        self.watchdog_thread = None
+        # Watchdog tracking - detect stale connections
+        self.last_successful_publish = 0
+        self.watchdog_timeout = 10.0  # Force reconnect if no publish for 10s
 
     def start(self):
         """Start the WebSocket connection in a background thread."""
         self.should_run = True
         self.ws_thread = threading.Thread(target=self._run_forever, daemon=True)
         self.ws_thread.start()
+        # Start watchdog to detect stale connections
+        self.watchdog_thread = threading.Thread(target=self._watchdog_loop, daemon=True)
+        self.watchdog_thread.start()
 
     def stop(self):
         """Stop the WebSocket connection."""
@@ -427,6 +434,21 @@ class FrequencyPublisher:
                 self.ws.close()
             except Exception:
                 pass
+
+    def _watchdog_loop(self):
+        """Periodically check for stale connections and force reconnect."""
+        while self.should_run:
+            time.sleep(3)  # Check every 3 seconds
+            with self.lock:
+                if self.connected and self.last_successful_publish > 0:
+                    elapsed = time.time() - self.last_successful_publish
+                    if elapsed > self.watchdog_timeout:
+                        print(f"[WS] Watchdog: No successful publish for {elapsed:.0f}s, forcing reconnect")
+                        logger.warning("Watchdog forcing reconnect after %ds", int(elapsed))
+                        try:
+                            self.ws.close()
+                        except Exception:
+                            pass
 
     def _run_forever(self):
         """Run WebSocket with auto-reconnection."""
@@ -509,6 +531,7 @@ class FrequencyPublisher:
                 }
             })
             self.ws.send(message)
+            self.last_successful_publish = time.time()  # Track for watchdog
             return True
         except Exception as e:
             logger.error("Publish error: %s", e)
