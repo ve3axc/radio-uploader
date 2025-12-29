@@ -359,6 +359,27 @@ def set_frequency(ser, freq_hz):
     return b'\xFB' in resp
 
 
+# Mode codes for CI-V command 0x06
+MODE_CODES = {
+    "LSB": 0x00, "USB": 0x01, "AM": 0x02, "CW": 0x03,
+    "RTTY": 0x04, "FM": 0x05, "CW-R": 0x07, "RTTY-R": 0x08
+}
+
+
+def set_mode(ser, mode_str):
+    """Set radio mode via CI-V command 0x06.
+
+    Returns True if successful, False otherwise.
+    """
+    mode_code = MODE_CODES.get(mode_str.upper())
+    if mode_code is None:
+        return False
+    cmd = [0xFE, 0xFE, CIV_ADDR_RADIO, CIV_ADDR_CONTROLLER, 0x06, mode_code, 0xFD]
+    ser.write(bytes(cmd))
+    resp = read_until_fd(ser, deadline_s=0.3)
+    return b'\xFB' in resp
+
+
 # ============================================================================
 # WebSocket Publisher
 # ============================================================================
@@ -517,17 +538,33 @@ class FirebaseListener:
             try:
                 response = requests.get(url, timeout=5)
                 if response.status_code == 200:
-                    freq_hz = response.json()
-                    if isinstance(freq_hz, (int, float)) and freq_hz > 0:
+                    data = response.json()
+                    freq_hz = None
+                    mode = None
+
+                    # Handle both formats:
+                    # Old: just a number (frequency in Hz)
+                    # New: {freq: 14025000, mode: "CW"}
+                    if isinstance(data, dict):
+                        freq_hz = data.get('freq')
+                        mode = data.get('mode')
+                    elif isinstance(data, (int, float)):
+                        freq_hz = data
+
+                    if freq_hz and freq_hz > 0:
                         # Only queue if different from last known
                         if freq_hz != self.last_freq:
                             self.last_freq = freq_hz
-                            command_queue.put({
+                            cmd = {
                                 'type': 'set_freq',
                                 'frequency_hz': int(freq_hz)
-                            })
-                            print(f"[FB] Received command: tune to {freq_hz/1e6:.6f} MHz")
-                            logger.info("Firebase command received: %s Hz", freq_hz)
+                            }
+                            if mode:
+                                cmd['mode'] = mode
+                            command_queue.put(cmd)
+                            mode_str = f" {mode}" if mode else ""
+                            print(f"[FB] Received command: tune to {freq_hz/1e6:.6f} MHz{mode_str}")
+                            logger.info("Firebase command received: %s Hz, mode=%s", freq_hz, mode)
             except Exception as e:
                 logger.error("Firebase poll error: %s", e)
 
@@ -644,14 +681,23 @@ Examples:
                 cmd = command_queue.get_nowait()
                 if cmd.get('type') == 'set_freq':
                     target_freq = cmd['frequency_hz']
+                    target_mode = cmd.get('mode')
                     timestamp = datetime.now().strftime("%H:%M:%S")
-                    print(f"[{timestamp}] TUNING to {target_freq/1e6:.6f} MHz...")
-                    if set_frequency(ser, target_freq):
-                        print(f"[{timestamp}] TUNED to {target_freq/1e6:.6f} MHz")
-                        logger.info("Set frequency: %s Hz", target_freq)
+                    mode_str = f" {target_mode}" if target_mode else ""
+                    print(f"[{timestamp}] TUNING to {target_freq/1e6:.6f} MHz{mode_str}...")
+
+                    freq_ok = set_frequency(ser, target_freq)
+                    mode_ok = True
+                    if target_mode:
+                        time.sleep(0.05)  # Brief pause between commands
+                        mode_ok = set_mode(ser, target_mode)
+
+                    if freq_ok and mode_ok:
+                        print(f"[{timestamp}] TUNED to {target_freq/1e6:.6f} MHz{mode_str}")
+                        logger.info("Set frequency: %s Hz, mode: %s", target_freq, target_mode)
                     else:
-                        print(f"[{timestamp}] TUNE FAILED for {target_freq/1e6:.6f} MHz")
-                        logger.error("Failed to set frequency: %s Hz", target_freq)
+                        print(f"[{timestamp}] TUNE FAILED (freq={freq_ok}, mode={mode_ok})")
+                        logger.error("Failed to set frequency: %s Hz, mode: %s", target_freq, target_mode)
                     time.sleep(0.1)  # Brief pause for radio to settle
             except queue.Empty:
                 pass
