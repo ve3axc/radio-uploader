@@ -371,13 +371,29 @@ def set_mode(ser, mode_str):
 
     Returns True if successful, False otherwise.
     """
-    mode_code = MODE_CODES.get(mode_str.upper())
+    if not mode_str:
+        print(f"[MODE] No mode specified, skipping")
+        return True  # Not an error, just no mode to set
+
+    mode_upper = mode_str.upper()
+    mode_code = MODE_CODES.get(mode_upper)
     if mode_code is None:
+        print(f"[MODE] Unknown mode: '{mode_str}' (upper: '{mode_upper}')")
         return False
+
+    # IC-7300 command 0x06: Set mode
+    # Format: FE FE 94 E0 06 <mode> FD
+    # Some radios need filter byte too, but IC-7300 accepts just mode
     cmd = [0xFE, 0xFE, CIV_ADDR_RADIO, CIV_ADDR_CONTROLLER, 0x06, mode_code, 0xFD]
+    print(f"[MODE] Setting mode to {mode_upper} (code: 0x{mode_code:02X})")
     ser.write(bytes(cmd))
     resp = read_until_fd(ser, deadline_s=0.3)
-    return b'\xFB' in resp
+    success = b'\xFB' in resp
+    if success:
+        print(f"[MODE] Mode set successfully")
+    else:
+        print(f"[MODE] Mode set FAILED, response: {resp.hex() if resp else 'none'}")
+    return success
 
 
 # ============================================================================
