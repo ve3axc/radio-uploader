@@ -23,6 +23,7 @@ import threading
 import ssl
 from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
+from typing import Optional
 
 def install_package(package_name):
     """Auto-install missing package."""
@@ -89,6 +90,9 @@ WEBSOCKET_URL = "wss://ws.ve3axc.com"
 # Firebase Realtime Database (for receiving frequency commands)
 FIREBASE_DB_URL = "https://ve3axc-online-logger-default-rtdb.europe-west1.firebasedatabase.app"
 
+# Optional logging endpoint (Start/Stop monitor)
+LOGGING_API_BASE = os.environ.get('LOGGING_API_BASE')
+
 # Command queue for frequency changes from Firebase
 command_queue = queue.Queue()
 
@@ -105,6 +109,75 @@ MODE_MAP = {
     0x00: "LSB", 0x01: "USB", 0x02: "AM", 0x03: "CW",
     0x04: "RTTY", 0x05: "FM", 0x07: "CW-R", 0x08: "RTTY-R"
 }
+
+
+class LoggingClient:
+    """Posts structured log entries to the log-session API when active."""
+
+    def __init__(self, base_url: str | None):
+        self.base_url = base_url.rstrip('/') if base_url else None
+        self.active_session_id = None
+        self.queue: queue.Queue = queue.Queue()
+        self.stop_event = threading.Event()
+        if self.base_url:
+            self.refresh_thread = threading.Thread(target=self._refresh_loop, daemon=True)
+            self.flush_thread = threading.Thread(target=self._flush_loop, daemon=True)
+            self.refresh_thread.start()
+            self.flush_thread.start()
+
+    def _refresh_loop(self):
+        while not self.stop_event.is_set():
+            try:
+                resp = requests.get(self.base_url, timeout=5)
+                data = resp.json() if resp.status_code == 200 else {}
+                self.active_session_id = data.get('active', {}).get('id')
+            except Exception:
+                self.active_session_id = None
+            self.stop_event.wait(5)
+
+    def log(self, source: str, payload: dict):
+        if not self.base_url or not self.active_session_id:
+            return
+        entry = {
+            'ts': datetime.utcnow().isoformat(timespec='milliseconds') + 'Z',
+            'source': source,
+            **payload
+        }
+        self.queue.put(entry)
+
+    def _flush_loop(self):
+        while not self.stop_event.is_set():
+            entries = []
+            try:
+                entry = self.queue.get(timeout=1)
+                entries.append(entry)
+                while len(entries) < 50:
+                    entries.append(self.queue.get_nowait())
+            except queue.Empty:
+                pass
+
+            if entries and self.active_session_id:
+                try:
+                    requests.post(f"{self.base_url}/events", json={'entries': entries}, timeout=5)
+                except Exception:
+                    for entry in entries:
+                        self.queue.put(entry)
+
+            self.stop_event.wait(1)
+
+    def stop(self):
+        if not self.base_url:
+            return
+        self.stop_event.set()
+
+
+session_logger: Optional[LoggingClient] = None
+
+
+def log_event(source: str, **payload):
+    if session_logger:
+        session_logger.log(source, payload)
+
 
 # No-response timeout (force reconnect after this many seconds)
 NO_RESPONSE_TIMEOUT = 10.0
@@ -403,7 +476,7 @@ def set_mode(ser, mode_str):
 class FrequencyPublisher:
     """WebSocket client for publishing frequency updates."""
 
-    def __init__(self, station_id):
+    def __init__(self, station_id, session_logger: Optional[LoggingClient] = None):
         self.station_id = station_id
         self.ws = None
         self.connected = False
@@ -416,6 +489,7 @@ class FrequencyPublisher:
         # Watchdog tracking - detect stale connections
         self.last_successful_publish = 0
         self.watchdog_timeout = 10.0  # Force reconnect if no publish for 10s
+        self.session_logger = session_logger
 
     def start(self):
         """Start the WebSocket connection in a background thread."""
@@ -445,6 +519,11 @@ class FrequencyPublisher:
                     if elapsed > self.watchdog_timeout:
                         print(f"[WS] Watchdog: No successful publish for {elapsed:.0f}s, forcing reconnect")
                         logger.warning("Watchdog forcing reconnect after %ds", int(elapsed))
+                        if self.session_logger:
+                            self.session_logger.log('radio_uploader.ws', {
+                                'event': 'watchdog_reconnect',
+                                'elapsed': int(elapsed)
+                            })
                         try:
                             self.ws.close()
                         except Exception:
@@ -490,6 +569,8 @@ class FrequencyPublisher:
             self.reconnect_delay = 1.0
         print("[WS] Connected to server")
         logger.info("WebSocket connected")
+        if self.session_logger:
+            self.session_logger.log('radio_uploader.ws', { 'event': 'connected' })
 
     def _on_close(self, ws, close_status_code, close_msg):
         """Handle connection closed."""
@@ -497,6 +578,12 @@ class FrequencyPublisher:
             self.connected = False
         print(f"[WS] Disconnected (code={close_status_code})")
         logger.info("WebSocket disconnected: %s", close_msg)
+        if self.session_logger:
+            self.session_logger.log('radio_uploader.ws', {
+                'event': 'disconnected',
+                'code': close_status_code,
+                'message': close_msg
+            })
 
     def _on_error(self, ws, error):
         """Handle connection error."""
@@ -504,6 +591,11 @@ class FrequencyPublisher:
             self.connected = False
         print(f"[WS] Error: {error}")
         logger.error("WebSocket error: %s", error)
+        if self.session_logger:
+            self.session_logger.log('radio_uploader.ws', {
+                'event': 'error',
+                'message': str(error)
+            })
 
     def _on_message(self, ws, message):
         """Handle incoming messages (not expected, but log them)."""
@@ -532,9 +624,21 @@ class FrequencyPublisher:
             })
             self.ws.send(message)
             self.last_successful_publish = time.time()  # Track for watchdog
+            if self.session_logger:
+                self.session_logger.log('radio_uploader.ws', {
+                    'event': 'publish',
+                    'frequency_hz': freq_hz,
+                    'mode': mode,
+                    'tx_status': tx_status
+                })
             return True
         except Exception as e:
             logger.error("Publish error: %s", e)
+            if self.session_logger:
+                self.session_logger.log('radio_uploader.ws', {
+                    'event': 'publish_error',
+                    'message': str(e)
+                })
             return False
 
     def is_connected(self):
@@ -550,12 +654,14 @@ class FrequencyPublisher:
 class FirebaseListener:
     """Polls Firebase for frequency change commands."""
 
-    def __init__(self, station_id):
+    def __init__(self, station_id, session_logger: Optional[LoggingClient] = None):
         self.station_id = station_id
         self.should_run = True
         self.thread = None
         self.last_freq = None
+        self.last_mode = None
         self.poll_interval = 2.0  # Check every 2 seconds
+        self.session_logger = session_logger
 
     def start(self):
         """Start the Firebase listener in a background thread."""
@@ -591,9 +697,10 @@ class FirebaseListener:
                         freq_hz = data
 
                     if freq_hz and freq_hz > 0:
-                        # Only queue if different from last known
-                        if freq_hz != self.last_freq:
+                        # Only queue if frequency OR mode changed
+                        if freq_hz != self.last_freq or mode != self.last_mode:
                             self.last_freq = freq_hz
+                            self.last_mode = mode
                             cmd = {
                                 'type': 'set_freq',
                                 'frequency_hz': int(freq_hz)
@@ -604,8 +711,19 @@ class FirebaseListener:
                             mode_str = f" {mode}" if mode else ""
                             print(f"[FB] Received command: tune to {freq_hz/1e6:.6f} MHz{mode_str}")
                             logger.info("Firebase command received: %s Hz, mode=%s", freq_hz, mode)
+                            if self.session_logger:
+                                self.session_logger.log('radio_uploader.firebase', {
+                                    'event': 'command',
+                                    'frequency_hz': freq_hz,
+                                    'mode': mode
+                                })
             except Exception as e:
                 logger.error("Firebase poll error: %s", e)
+                if self.session_logger:
+                    self.session_logger.log('radio_uploader.firebase', {
+                        'event': 'error',
+                        'message': str(e)
+                    })
 
             # Wait before next poll
             time.sleep(self.poll_interval)
@@ -638,6 +756,8 @@ Examples:
                         help="Poll interval in seconds (default: 0.3)")
     parser.add_argument("--upload-interval", type=float, default=5.0,
                         help="Min seconds between uploads if no change (default: 5.0)")
+    parser.add_argument("--log-endpoint", default=None,
+                        help="Optional log session API base (default from LOGGING_API_BASE env)")
     args = parser.parse_args()
 
     if not args.station_id or len(args.station_id) < 4:
@@ -660,6 +780,14 @@ Examples:
         except Exception:
             print("[INIT] Sleep prevention: FAILED")
 
+    log_api = args.log_endpoint or LOGGING_API_BASE
+    global session_logger
+    if log_api:
+        session_logger = LoggingClient(log_api)
+        print(f"[INIT] Log endpoint: {log_api}")
+    else:
+        print("[INIT] Log endpoint: (disabled)")
+
     print(f"[INIT] Station ID: {args.station_id}")
     print(f"[INIT] WebSocket: {WEBSOCKET_URL}")
     print(f"[INIT] Logging to: {LOG_PATH}")
@@ -667,15 +795,16 @@ Examples:
         print(f"[INIT] Callsign: {args.callsign}")
     logger.info("START pid=%s station_id=%s callsign=%s",
                 os.getpid(), args.station_id, args.callsign)
+    log_event('radio_uploader', event='start', station_id=args.station_id, callsign=args.callsign)
     print("-" * 60)
 
     # Start WebSocket publisher
-    publisher = FrequencyPublisher(args.station_id)
+    publisher = FrequencyPublisher(args.station_id, session_logger)
     publisher.start()
     print("[INIT] WebSocket publisher started")
 
     # Start Firebase listener for remote frequency control
-    firebase_listener = FirebaseListener(args.station_id)
+    firebase_listener = FirebaseListener(args.station_id, session_logger)
     firebase_listener.start()
     print("[INIT] Firebase listener started")
 
@@ -713,6 +842,7 @@ Examples:
                     conn_msg += f" (reconnect #{reconnect_count})"
                 print(conn_msg)
                 logger.info("CONNECTED port=%s", ser.port)
+                log_event('radio_uploader.radio', event='serial_connected', port=ser.port)
                 print("-" * 60)
 
             # Check for pending frequency commands from Firebase
@@ -734,9 +864,11 @@ Examples:
                     if freq_ok and mode_ok:
                         print(f"[{timestamp}] TUNED to {target_freq/1e6:.6f} MHz{mode_str}")
                         logger.info("Set frequency: %s Hz, mode: %s", target_freq, target_mode)
+                        log_event('radio_uploader.radio', event='command_applied', frequency_hz=target_freq, mode=target_mode)
                     else:
                         print(f"[{timestamp}] TUNE FAILED (freq={freq_ok}, mode={mode_ok})")
                         logger.error("Failed to set frequency: %s Hz, mode: %s", target_freq, target_mode)
+                        log_event('radio_uploader.radio', event='command_failed', frequency_hz=target_freq, mode=target_mode, freq_ok=freq_ok, mode_ok=mode_ok)
                     time.sleep(0.1)  # Brief pause for radio to settle
             except queue.Empty:
                 pass
@@ -757,6 +889,7 @@ Examples:
                 freq_mhz = freq / 1e6
                 timestamp = datetime.now().strftime("%H:%M:%S")
                 now = time.time()
+                log_event('radio_uploader.radio', event='sample', frequency_hz=freq, mode=mode, tx_status=tx_status)
 
                 freq_changed = (freq != last_freq or mode != last_mode)
                 # Publish on change, or every 1 second as heartbeat
@@ -790,6 +923,7 @@ Examples:
         except PlannedReconnect as e:
             error_time = datetime.now().strftime("%H:%M:%S")
             print(f"[{error_time}] RECONNECT: {e}")
+            log_event('radio_uploader.error', event='planned_reconnect', message=str(e))
 
             if ser:
                 safe_close(ser)
@@ -809,6 +943,7 @@ Examples:
             error_time = datetime.now().strftime("%H:%M:%S")
             print(f"[{error_time}] ERROR: {type(e).__name__}: {e}")
             logger.error("EXCEPTION type=%s msg=%r", type(e).__name__, str(e))
+            log_event('radio_uploader.error', event='exception', type=type(e).__name__, message=str(e))
 
             if ser:
                 safe_close(ser)
@@ -840,6 +975,9 @@ Examples:
 
     print(f"[EXIT] Done. Published: {publish_count}, Reconnects: {reconnect_count}")
     logger.info("EXIT publishes=%s reconnects=%s", publish_count, reconnect_count)
+    log_event('radio_uploader', event='stop', publishes=publish_count, reconnects=reconnect_count)
+    if session_logger:
+        session_logger.stop()
 
 
 if __name__ == "__main__":
