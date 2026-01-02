@@ -598,13 +598,42 @@ class FrequencyPublisher:
             })
 
     def _on_message(self, ws, message):
-        """Handle incoming messages (not expected, but log them)."""
+        """Handle incoming messages from WebSocket server."""
         try:
             data = json.loads(message)
-            if data.get("type") == "error":
+            msg_type = data.get("type")
+
+            if msg_type == "error":
                 print(f"[WS] Server error: {data.get('message')}")
-        except Exception:
-            pass
+
+            elif msg_type == "tune_radio":
+                # Reverse sync: SDR wants to tune the radio
+                freq_hz = data.get("frequency_hz")
+                mode = data.get("mode")
+                if freq_hz:
+                    cmd = {
+                        'type': 'set_freq',
+                        'frequency_hz': int(freq_hz),
+                    }
+                    if mode:
+                        cmd['mode'] = mode
+                    command_queue.put(cmd)
+                    mode_str = f" {mode}" if mode else ""
+                    print(f"[WS] Tune command received: {freq_hz/1e6:.6f} MHz{mode_str}")
+                    logger.info("WebSocket tune command: %s Hz, mode=%s", freq_hz, mode)
+                    if self.session_logger:
+                        self.session_logger.log('radio_uploader.ws', {
+                            'event': 'tune_command',
+                            'frequency_hz': freq_hz,
+                            'mode': mode
+                        })
+
+            elif msg_type == "tune_radio_ack":
+                # Acknowledgment (we're the one sending, so ignore)
+                pass
+
+        except Exception as e:
+            logger.debug("Message parse error: %s", e)
 
     def publish(self, freq_hz, mode, tx_status=False):
         """Publish frequency update to server."""
